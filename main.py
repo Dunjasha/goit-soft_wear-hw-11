@@ -1,30 +1,32 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
 from datetime import date, datetime, timedelta
-from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
-from bson.errors import InvalidId
+from sqlalchemy import Column, Integer, String, Date, select, or_, and_
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import IntegrityError
+
+
+DATABASE_URL = "postgresql+asyncpg://user:57449@localhost:5432/contacts_db"
+
+engine = create_async_engine(DATABASE_URL, echo=True)
+SessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
 
 app = FastAPI()
 
-MONGO_DETAILS = "mongodb+srv://user2008:ninesoft@cluster0.8nyejvu.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-client = AsyncIOMotorClient(MONGO_DETAILS)
-database = client.contacts_db
-contacts_collection = database.get_collection("contacts")
+class ContactModel(Base):
+    __tablename__ = "contacts"
 
-
-def contact_helper(contact) -> dict:
-    return {
-        "id": str(contact["_id"]),
-        "first_name": contact["first_name"],
-        "last_name": contact["last_name"],
-        "email": contact["email"],
-        "phone": contact["phone"],
-        "birthday": contact["birthday"].date() if "birthday" in contact else None,
-        "additional_data": contact.get("additional_data"),
-    }
+    id = Column(Integer, primary_key=True, index=True)
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False)
+    phone = Column(String, unique=True, nullable=False)
+    birthday = Column(Date, nullable=False)
+    additional_data = Column(String, nullable=True)
 
 
 class Contact(BaseModel):
@@ -35,131 +37,125 @@ class Contact(BaseModel):
     birthday: date = Field(..., example="1990-05-21")
     additional_data: Optional[str] = Field(None, example="Колега по роботі")
 
+    class Config:
+        orm_mode = True
+
 class ContactUpdate(Contact):
     pass
 
-@app.post("/contacts/", response_model=Contact)
-async def create_contact(contact: Contact):
-    contact_data = contact.dict()
-    contact_data["birthday"] = datetime.combine(contact_data["birthday"], datetime.min.time())
+class ContactResponse(Contact):
+    id: int
 
-    if await contacts_collection.find_one({"email": contact_data["email"]}):
-        raise HTTPException(status_code=400, detail="Email вже використовується")
-    if await contacts_collection.find_one({"phone": contact_data["phone"]}):
-        raise HTTPException(status_code=400, detail="Телефон вже використовується")
 
-    result = await contacts_collection.insert_one(contact_data)
-    new_contact = await contacts_collection.find_one({"_id": result.inserted_id})
-    return contact_helper(new_contact)
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-@app.get("/contacts/", response_model=List[Contact])
-async def list_contacts(search: Optional[str] = None):
-    query = {}
-    if search:
-        query = {
-            "$or": [
-                {"first_name": {"$regex": search, "$options": "i"}},
-                {"last_name": {"$regex": search, "$options": "i"}},
-                {"email": {"$regex": search, "$options": "i"}},
-            ]
-        }
-    contacts = []
-    cursor = contacts_collection.find(query)
-    async for document in cursor:
-        contacts.append(contact_helper(document))
-    return contacts
 
-@app.get("/contacts/{contact_id}", response_model=Contact)
-async def get_contact(contact_id: str):
-    try:
-        oid = ObjectId(contact_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Невірний ідентифікатор контакту")
-    contact = await contacts_collection.find_one({"_id": oid})
-    if contact:
-        return contact_helper(contact)
-    raise HTTPException(status_code=404, detail="Контакт не знайдено")
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
 
-@app.put("/contacts/{contact_id}", response_model=Contact)
-async def update_contact(contact_id: str, contact_update: ContactUpdate):
-    try:
-        oid = ObjectId(contact_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Невірний ідентифікатор контакту")
 
-    contact_data = contact_update.dict()
-    contact_data["birthday"] = datetime.combine(contact_data["birthday"], datetime.min.time())
-
-  
-    existing_email = await contacts_collection.find_one({"email": contact_data["email"], "_id": {"$ne": oid}})
-    if existing_email:
-        raise HTTPException(status_code=400, detail="Email вже використовується")
-    existing_phone = await contacts_collection.find_one({"phone": contact_data["phone"], "_id": {"$ne": oid}})
-    if existing_phone:
-        raise HTTPException(status_code=400, detail="Телефон вже використовується")
-
-    result = await contacts_collection.update_one(
-        {"_id": oid},
-        {"$set": contact_data}
+async def check_unique(db: AsyncSession, email: str, phone: str, exclude_id: Optional[int] = None):
+    query = select(ContactModel).where(
+        or_(
+            ContactModel.email == email,
+            ContactModel.phone == phone
+        )
     )
-    if result.modified_count == 1:
-        updated_contact = await contacts_collection.find_one({"_id": oid})
-        return contact_helper(updated_contact)
-    raise HTTPException(status_code=404, detail="Контакт не знайдено")
+    if exclude_id:
+        query = query.where(ContactModel.id != exclude_id)
+
+    result = await db.execute(query)
+    existing = result.scalars().first()
+    if existing:
+        if existing.email == email:
+            raise HTTPException(status_code=400, detail="Email вже використовується")
+        if existing.phone == phone:
+            raise HTTPException(status_code=400, detail="Телефон вже використовується")
+
+
+@app.post("/contacts/", response_model=ContactResponse)
+async def create_contact(contact: Contact, db: AsyncSession = Depends(get_db)):
+    await check_unique(db, contact.email, contact.phone)
+
+    new_contact = ContactModel(**contact.dict())
+    db.add(new_contact)
+    await db.commit()
+    await db.refresh(new_contact)
+    return new_contact
+
+
+@app.get("/contacts/", response_model=List[ContactResponse])
+async def list_contacts(search: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    query = select(ContactModel)
+    if search:
+        like = f"%{search}%"
+        query = query.where(or_(
+            ContactModel.first_name.ilike(like),
+            ContactModel.last_name.ilike(like),
+            ContactModel.email.ilike(like)
+        ))
+
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@app.get("/contacts/{contact_id}", response_model=ContactResponse)
+async def get_contact(contact_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ContactModel).where(ContactModel.id == contact_id))
+    contact = result.scalar()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Контакт не знайдено")
+    return contact
+
+
+@app.put("/contacts/{contact_id}", response_model=ContactResponse)
+async def update_contact(contact_id: int, updated: ContactUpdate, db: AsyncSession = Depends(get_db)):
+    await check_unique(db, updated.email, updated.phone, exclude_id=contact_id)
+
+    result = await db.execute(select(ContactModel).where(ContactModel.id == contact_id))
+    contact = result.scalar()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Контакт не знайдено")
+
+    for key, value in updated.dict().items():
+        setattr(contact, key, value)
+
+    await db.commit()
+    await db.refresh(contact)
+    return contact
+
 
 @app.delete("/contacts/{contact_id}", status_code=204)
-async def delete_contact(contact_id: str):
-    try:
-        oid = ObjectId(contact_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Невірний ідентифікатор контакту")
+async def delete_contact(contact_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ContactModel).where(ContactModel.id == contact_id))
+    contact = result.scalar()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Контакт не знайдено")
 
-    result = await contacts_collection.delete_one({"_id": oid})
-    if result.deleted_count == 1:
-        return
-    raise HTTPException(status_code=404, detail="Контакт не знайдено")
+    await db.delete(contact)
+    await db.commit()
 
 
-@app.get("/contacts/upcoming-birthdays/", response_model=List[Contact])
-async def upcoming_birthdays():
-    today = datetime.utcnow()
+@app.get("/contacts/upcoming-birthdays/", response_model=List[ContactResponse])
+async def upcoming_birthdays(db: AsyncSession = Depends(get_db)):
+    today = date.today()
     in_seven_days = today + timedelta(days=7)
 
-    
-    pipeline = [
-        {
-            "$addFields": {
-                "birthMonth": {"$month": "$birthday"},
-                "birthDay": {"$dayOfMonth": "$birthday"},
-            }
-        },
-        {
-            "$match": {
-                "$expr": {
-                    "$and": [
-                        {"$gte": [
-                            {"$dateFromParts": {
-                                "year": today.year,
-                                "month": "$birthMonth",
-                                "day": "$birthDay"
-                            }},
-                            today
-                        ]},
-                        {"$lte": [
-                            {"$dateFromParts": {
-                                "year": today.year,
-                                "month": "$birthMonth",
-                                "day": "$birthDay"
-                            }},
-                            in_seven_days
-                        ]}
-                    ]
-                }
-            }
-        }
-    ]
+    result = await db.execute(select(ContactModel))
+    contacts = result.scalars().all()
 
-    contacts = []
-    async for doc in contacts_collection.aggregate(pipeline):
-        contacts.append(contact_helper(doc))
-    return contacts
+    upcoming = []
+    for contact in contacts:
+        bday = contact.birthday.replace(year=today.year)
+        if today <= bday <= in_seven_days:
+            upcoming.append(contact)
+
+    return upcoming
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
